@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { supabase, isSupabaseConfigured } from "./lib/supabase";
 import { CURRICULUM, SEED_PROBLEMS } from "./data/curriculum";
 import AuthGate from "./components/AuthGate";
@@ -41,14 +41,23 @@ function mergeCurriculum(baseList, customItems, hiddenState) {
   });
 
   customItems.forEach(({ course, topic }) => {
-    if (!course || course === HIDDEN_COURSE_MARKER || course === HIDDEN_TOPIC_MARKER) {
+    if (
+      !course ||
+      course === HIDDEN_COURSE_MARKER ||
+      course === HIDDEN_TOPIC_MARKER
+    ) {
       return;
     }
+    if (hiddenCourses.has(course)) return;
+
     if (!map.has(course)) {
       map.set(course, new Set());
     }
     if (topic && topic.trim()) {
-      map.get(course).add(topic.trim());
+      const cleanTopic = topic.trim();
+      if (!hiddenTopics.has(`${course}:::${cleanTopic}`)) {
+        map.get(course).add(cleanTopic);
+      }
     }
   });
 
@@ -109,18 +118,17 @@ export default function App() {
     }
   });
 
-  const applyLocalAdjustments = (
-    list,
-    overrides = problemOverrides,
-    deleted = deletedIds
-  ) => {
-    const deletedSet = new Set(deleted);
-    return list
-      .filter((item) => !deletedSet.has(item.id))
-      .map((item) =>
-        overrides[item.id] ? { ...item, ...overrides[item.id] } : item
-      );
-  };
+  const applyLocalAdjustments = useCallback(
+    (list, overrides = problemOverrides, deleted = deletedIds) => {
+      const deletedSet = new Set(deleted);
+      return list
+        .filter((item) => !deletedSet.has(item.id))
+        .map((item) =>
+          overrides[item.id] ? { ...item, ...overrides[item.id] } : item
+        );
+    },
+    [problemOverrides, deletedIds]
+  );
 
   const [problems, setProblems] = useState(() =>
     applyLocalAdjustments([...localGeneratedProblems, ...SEED_PROBLEMS])
@@ -182,6 +190,32 @@ export default function App() {
     localStorage.setItem(DELETED_PROBLEMS_KEY, JSON.stringify(deletedIds));
   }, [deletedIds]);
 
+  // Sincronización instantánea entre pestañas del mismo navegador
+  useEffect(() => {
+    const handleStorageSync = (e) => {
+      if (e.key === CUSTOM_CURRICULUM_KEY && e.newValue) {
+        try {
+          setCustomCurriculum(JSON.parse(e.newValue));
+        } catch {}
+      }
+      if (e.key === HIDDEN_CURRICULUM_KEY && e.newValue) {
+        try {
+          setHiddenCurriculum(JSON.parse(e.newValue));
+        } catch {}
+      }
+      if (e.key === LOCAL_PROBLEMS_KEY && e.newValue) {
+        try {
+          const parsed = JSON.parse(e.newValue);
+          setLocalGeneratedProblems(parsed);
+          setProblems(applyLocalAdjustments([...parsed, ...SEED_PROBLEMS]));
+        } catch {}
+      }
+    };
+
+    window.addEventListener("storage", handleStorageSync);
+    return () => window.removeEventListener("storage", handleStorageSync);
+  }, [applyLocalAdjustments]);
+
   useEffect(() => {
     const root = document.documentElement;
     if (darkMode) {
@@ -193,37 +227,21 @@ export default function App() {
     }
   }, [darkMode]);
 
-  useEffect(() => {
-    if (!isSupabaseConfigured || !supabase) return;
+  // Fuente única de verdad desde Supabase para asignaturas y temas
+  const loadCustomCurriculumFromDb = useCallback(async () => {
+    if (!isSupabaseConfigured || !supabase || demoMode) return;
 
-    supabase.auth.getSession().then(({ data: { session: s } }) => {
-      setSession(s);
-      if (s) fetchProfileAndProblems(s.user.id);
-    });
-
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, s) => {
-      setSession(s);
-      if (s) {
-        fetchProfileAndProblems(s.user.id);
-      } else {
-        setProfile(null);
-        setProfileError(null);
-      }
-    });
-
-    return () => subscription.unsubscribe();
-  }, []);
-
-  const loadCustomCurriculumFromDb = async () => {
-    if (!isSupabaseConfigured || !supabase) return;
     const { data, error } = await supabase
       .from("custom_curriculum")
       .select("id, course, topic")
       .order("created_at", { ascending: true });
 
-    if (!error && Array.isArray(data)) {
+    if (error) {
+      console.error("Error leyendo custom_curriculum:", error.message);
+      return;
+    }
+
+    if (Array.isArray(data)) {
       const normalRows = [];
       const dbHiddenCourses = new Set();
       const dbHiddenTopics = new Set();
@@ -238,27 +256,16 @@ export default function App() {
         }
       });
 
-      setCustomCurriculum((prev) => {
-        const merged = [...normalRows];
-        prev.forEach((localItem) => {
-          const exists = merged.some(
-            (dbItem) =>
-              dbItem.course === localItem.course &&
-              (dbItem.topic || "") === (localItem.topic || "")
-          );
-          if (!exists) merged.push(localItem);
-        });
-        return merged;
+      // Reemplaza exactamente con el estado actual de la BD (refleja tanto altas como bajas)
+      setCustomCurriculum(normalRows);
+      setHiddenCurriculum({
+        courses: Array.from(dbHiddenCourses),
+        topics: Array.from(dbHiddenTopics),
       });
-
-      setHiddenCurriculum((prev) => ({
-        courses: Array.from(new Set([...(prev.courses || []), ...dbHiddenCourses])),
-        topics: Array.from(new Set([...(prev.topics || []), ...dbHiddenTopics])),
-      }));
     }
-  };
+  }, [demoMode]);
 
-  const reloadApprovedProblems = async () => {
+  const reloadApprovedProblems = useCallback(async () => {
     if (!isSupabaseConfigured || !supabase || demoMode) {
       setProblems(
         applyLocalAdjustments([...localGeneratedProblems, ...SEED_PROBLEMS])
@@ -296,39 +303,112 @@ export default function App() {
         ...allDbProblems,
       ])
     );
-  };
+  }, [demoMode, localGeneratedProblems, applyLocalAdjustments]);
 
-  const fetchProfileAndProblems = async (userId) => {
-    setLoadingProfile(true);
-    setProfileError(null);
+  const fetchProfileAndProblems = useCallback(
+    async (userId) => {
+      setLoadingProfile(true);
+      setProfileError(null);
 
-    try {
-      const { data: prof, error: profErr } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("id", userId)
-        .single();
+      try {
+        const { data: prof, error: profErr } = await supabase
+          .from("profiles")
+          .select("*")
+          .eq("id", userId)
+          .single();
 
-      if (profErr) {
-        setProfileError(profErr.message);
+        if (profErr) {
+          setProfileError(profErr.message);
+          setProfile(null);
+          return;
+        }
+
+        setProfile(prof);
+
+        if (prof?.is_approved) {
+          await Promise.all([
+            reloadApprovedProblems(),
+            loadCustomCurriculumFromDb(),
+          ]);
+        }
+      } catch (err) {
+        setProfileError(err.message || "Error inesperado al cargar el perfil.");
+      } finally {
+        setLoadingProfile(false);
+      }
+    },
+    [reloadApprovedProblems, loadCustomCurriculumFromDb]
+  );
+
+  useEffect(() => {
+    if (!isSupabaseConfigured || !supabase) return;
+
+    supabase.auth.getSession().then(({ data: { session: s } }) => {
+      setSession(s);
+      if (s) fetchProfileAndProblems(s.user.id);
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, s) => {
+      setSession(s);
+      if (s) {
+        fetchProfileAndProblems(s.user.id);
+      } else {
         setProfile(null);
-        return;
+        setProfileError(null);
       }
+    });
 
-      setProfile(prof);
+    return () => subscription.unsubscribe();
+  }, [fetchProfileAndProblems]);
 
-      if (prof?.is_approved) {
-        await Promise.all([
-          reloadApprovedProblems(),
-          loadCustomCurriculumFromDb(),
-        ]);
-      }
-    } catch (err) {
-      setProfileError(err.message || "Error inesperado al cargar el perfil.");
-    } finally {
-      setLoadingProfile(false);
+  // SUSCRIPCIÓN EN TIEMPO REAL (Supabase Realtime + Respaldo automático)
+  useEffect(() => {
+    if (
+      !isSupabaseConfigured ||
+      !supabase ||
+      demoMode ||
+      !session ||
+      !profile?.is_approved
+    ) {
+      return;
     }
-  };
+
+    const channel = supabase
+      .channel("pem-trainer-realtime-sync")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "custom_curriculum" },
+        () => {
+          loadCustomCurriculumFromDb();
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "problems" },
+        () => {
+          reloadApprovedProblems();
+        }
+      )
+      .subscribe();
+
+    // Respaldo de sincronización cada 10s por si Realtime no está habilitado en la tabla
+    const intervalId = setInterval(() => {
+      loadCustomCurriculumFromDb();
+    }, 10000);
+
+    return () => {
+      supabase.removeChannel(channel);
+      clearInterval(intervalId);
+    };
+  }, [
+    demoMode,
+    session,
+    profile?.is_approved,
+    loadCustomCurriculumFromDb,
+    reloadApprovedProblems,
+  ]);
 
   const handleUpdateProblem = async (updatedProblem) => {
     const {
@@ -410,7 +490,6 @@ export default function App() {
 
     const cleanTopics = initialTopics.map((t) => t.trim()).filter(Boolean);
 
-    // Si estaba oculta previamente, rehabilitarla
     setHiddenCurriculum((prev) => ({
       courses: prev.courses.filter(
         (c) => c.toLowerCase() !== cleanCourse.toLowerCase()
@@ -426,7 +505,7 @@ export default function App() {
     const newRows =
       cleanTopics.length > 0
         ? cleanTopics.map((topic) => ({ course: cleanCourse, topic }))
-        : [{ course: cleanCourse, topic: null }];
+        : [{ course: cleanCourse, topic: "" }];
 
     setCustomCurriculum((prev) => {
       const next = [...prev];
@@ -450,9 +529,11 @@ export default function App() {
         .eq("course", HIDDEN_COURSE_MARKER)
         .eq("topic", cleanCourse);
 
-      await supabase.from("custom_curriculum").upsert(newRows, {
-        onConflict: "course,topic",
-      });
+      const { error } = await supabase.from("custom_curriculum").insert(newRows);
+      if (error) {
+        console.error("Error guardando asignatura:", error.message);
+        alert("Error al sincronizar asignatura en Supabase: " + error.message);
+      }
       await loadCustomCurriculumFromDb();
     }
   };
@@ -496,11 +577,14 @@ export default function App() {
         .eq("course", HIDDEN_TOPIC_MARKER)
         .eq("topic", hiddenKey);
 
-      await supabase
+      const { error } = await supabase
         .from("custom_curriculum")
-        .upsert([{ course: cleanCourse, topic: cleanTopic }], {
-          onConflict: "course,topic",
-        });
+        .insert([{ course: cleanCourse, topic: cleanTopic }]);
+
+      if (error) {
+        console.error("Error guardando tema:", error.message);
+        alert("Error al sincronizar tema en Supabase: " + error.message);
+      }
       await loadCustomCurriculumFromDb();
     }
   };
@@ -529,10 +613,9 @@ export default function App() {
       if (isBaseCourse) {
         await supabase
           .from("custom_curriculum")
-          .upsert([{ course: HIDDEN_COURSE_MARKER, topic: courseName }], {
-            onConflict: "course,topic",
-          });
+          .insert([{ course: HIDDEN_COURSE_MARKER, topic: courseName }]);
       }
+      await loadCustomCurriculumFromDb();
     }
   };
 
@@ -546,7 +629,6 @@ export default function App() {
       const remaining = prev.filter(
         (item) => !(item.course === courseName && item.topic === topicName)
       );
-      // Si era una asignatura personalizada y se quedó sin filas, conservar la asignatura vacía
       const isCustomCourse = !baseCourse;
       const stillHasCourseRow = remaining.some(
         (item) => item.course === courseName
@@ -554,7 +636,7 @@ export default function App() {
       if (isCustomCourse && !stillHasCourseRow) {
         return [
           ...remaining,
-          { id: `local-${Date.now()}`, course: courseName, topic: null },
+          { id: `local-${Date.now()}`, course: courseName, topic: "" },
         ];
       }
       return remaining;
@@ -575,20 +657,24 @@ export default function App() {
         .eq("topic", topicName);
 
       if (!baseCourse) {
-        await supabase
+        const { data: leftRows } = await supabase
           .from("custom_curriculum")
-          .upsert([{ course: courseName, topic: null }], {
-            onConflict: "course,topic",
-          });
+          .select("id")
+          .eq("course", courseName);
+
+        if (!leftRows || leftRows.length === 0) {
+          await supabase
+            .from("custom_curriculum")
+            .insert([{ course: courseName, topic: "" }]);
+        }
       }
 
       if (isBaseTopic) {
         await supabase
           .from("custom_curriculum")
-          .upsert([{ course: HIDDEN_TOPIC_MARKER, topic: hiddenKey }], {
-            onConflict: "course,topic",
-          });
+          .insert([{ course: HIDDEN_TOPIC_MARKER, topic: hiddenKey }]);
       }
+      await loadCustomCurriculumFromDb();
     }
   };
 
@@ -601,6 +687,7 @@ export default function App() {
         .from("custom_curriculum")
         .delete()
         .in("course", [HIDDEN_COURSE_MARKER, HIDDEN_TOPIC_MARKER]);
+      await loadCustomCurriculumFromDb();
     }
   };
 
