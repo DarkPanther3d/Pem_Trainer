@@ -227,7 +227,7 @@ export default function App() {
     }
   }, [darkMode]);
 
-  // Fuente única de verdad desde Supabase para asignaturas y temas
+ // Fuente única de verdad desde Supabase + migración automática de cambios locales previos del Admin
   const loadCustomCurriculumFromDb = useCallback(async () => {
     if (!isSupabaseConfigured || !supabase || demoMode) return;
 
@@ -256,14 +256,91 @@ export default function App() {
         }
       });
 
-      // Reemplaza exactamente con el estado actual de la BD (refleja tanto altas como bajas)
+      // Si eres admin y tenías asignaturas/temas guardados en localStorage antes de activar Realtime, súbelos ahora
+      if (profile?.role === "admin") {
+        const localSavedCustom = JSON.parse(
+          localStorage.getItem(CUSTOM_CURRICULUM_KEY) || "[]"
+        );
+        const localSavedHidden = JSON.parse(
+          localStorage.getItem(HIDDEN_CURRICULUM_KEY) ||
+            '{"courses":[],"topics":[]}'
+        );
+
+        const missingRows = [];
+
+        localSavedCustom.forEach((loc) => {
+          if (
+            !loc.course ||
+            loc.course === HIDDEN_COURSE_MARKER ||
+            loc.course === HIDDEN_TOPIC_MARKER
+          ) {
+            return;
+          }
+          const existsInDb = normalRows.some(
+            (dbRow) =>
+              dbRow.course === loc.course &&
+              (dbRow.topic || "") === (loc.topic || "")
+          );
+          if (!existsInDb) {
+            missingRows.push({ course: loc.course, topic: loc.topic || "" });
+          }
+        });
+
+        (localSavedHidden.courses || []).forEach((c) => {
+          if (!dbHiddenCourses.has(c)) {
+            missingRows.push({ course: HIDDEN_COURSE_MARKER, topic: c });
+          }
+        });
+
+        (localSavedHidden.topics || []).forEach((t) => {
+          if (!dbHiddenTopics.has(t)) {
+            missingRows.push({ course: HIDDEN_TOPIC_MARKER, topic: t });
+          }
+        });
+
+        if (missingRows.length > 0) {
+          const { error: syncErr } = await supabase
+            .from("custom_curriculum")
+            .insert(missingRows);
+
+          if (!syncErr) {
+            // Volver a leer la tabla ya con los datos migrados
+            const { data: refreshed } = await supabase
+              .from("custom_curriculum")
+              .select("id, course, topic")
+              .order("created_at", { ascending: true });
+
+            if (refreshed) {
+              const finalRows = [];
+              const finalHiddenC = new Set();
+              const finalHiddenT = new Set();
+              refreshed.forEach((r) => {
+                if (r.course === HIDDEN_COURSE_MARKER && r.topic)
+                  finalHiddenC.add(r.topic);
+                else if (r.course === HIDDEN_TOPIC_MARKER && r.topic)
+                  finalHiddenT.add(r.topic);
+                else finalRows.push(r);
+              });
+              setCustomCurriculum(finalRows);
+              setHiddenCurriculum({
+                courses: Array.from(finalHiddenC),
+                topics: Array.from(finalHiddenT),
+              });
+              return;
+            }
+          } else {
+            console.error("Error migrando cambios locales:", syncErr.message);
+          }
+        }
+      }
+
       setCustomCurriculum(normalRows);
       setHiddenCurriculum({
         courses: Array.from(dbHiddenCourses),
         topics: Array.from(dbHiddenTopics),
       });
     }
-  }, [demoMode]);
+  }, [demoMode, profile?.role]);
 
   const reloadApprovedProblems = useCallback(async () => {
     if (!isSupabaseConfigured || !supabase || demoMode) {
