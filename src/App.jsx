@@ -190,7 +190,7 @@ export default function App() {
     localStorage.setItem(DELETED_PROBLEMS_KEY, JSON.stringify(deletedIds));
   }, [deletedIds]);
 
-  // Sincronización instantánea entre pestañas del mismo navegador
+  // Sincronización entre pestañas del mismo navegador
   useEffect(() => {
     const handleStorageSync = (e) => {
       if (e.key === CUSTOM_CURRICULUM_KEY && e.newValue) {
@@ -203,18 +203,11 @@ export default function App() {
           setHiddenCurriculum(JSON.parse(e.newValue));
         } catch {}
       }
-      if (e.key === LOCAL_PROBLEMS_KEY && e.newValue) {
-        try {
-          const parsed = JSON.parse(e.newValue);
-          setLocalGeneratedProblems(parsed);
-          setProblems(applyLocalAdjustments([...parsed, ...SEED_PROBLEMS]));
-        } catch {}
-      }
     };
 
     window.addEventListener("storage", handleStorageSync);
     return () => window.removeEventListener("storage", handleStorageSync);
-  }, [applyLocalAdjustments]);
+  }, []);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -227,37 +220,51 @@ export default function App() {
     }
   }, [darkMode]);
 
- // Fuente única de verdad desde Supabase + migración automática de cambios locales previos del Admin
-  const loadCustomCurriculumFromDb = useCallback(async () => {
-    if (!isSupabaseConfigured || !supabase || demoMode) return;
+  const parseCurriculumRows = (rows) => {
+    const normalRows = [];
+    const dbHiddenCourses = new Set();
+    const dbHiddenTopics = new Set();
 
-    const { data, error } = await supabase
-      .from("custom_curriculum")
-      .select("id, course, topic")
-      .order("created_at", { ascending: true });
+    rows.forEach((row) => {
+      if (row.course === HIDDEN_COURSE_MARKER && row.topic) {
+        dbHiddenCourses.add(row.topic);
+      } else if (row.course === HIDDEN_TOPIC_MARKER && row.topic) {
+        dbHiddenTopics.add(row.topic);
+      } else {
+        normalRows.push(row);
+      }
+    });
 
-    if (error) {
-      console.error("Error leyendo custom_curriculum:", error.message);
-      return;
-    }
+    return {
+      normalRows,
+      dbHiddenCourses: Array.from(dbHiddenCourses),
+      dbHiddenTopics: Array.from(dbHiddenTopics),
+    };
+  };
 
-    if (Array.isArray(data)) {
-      const normalRows = [];
-      const dbHiddenCourses = new Set();
-      const dbHiddenTopics = new Set();
+  // Carga directa desde Supabase y migración segura si el usuario actual es admin
+  const loadCustomCurriculumFromDb = useCallback(
+    async (explicitRole = null) => {
+      if (!isSupabaseConfigured || !supabase || demoMode) return;
 
-      data.forEach((row) => {
-        if (row.course === HIDDEN_COURSE_MARKER && row.topic) {
-          dbHiddenCourses.add(row.topic);
-        } else if (row.course === HIDDEN_TOPIC_MARKER && row.topic) {
-          dbHiddenTopics.add(row.topic);
-        } else {
-          normalRows.push(row);
-        }
-      });
+      const { data, error } = await supabase
+        .from("custom_curriculum")
+        .select("id, course, topic")
+        .order("created_at", { ascending: true });
 
-      // Si eres admin y tenías asignaturas/temas guardados en localStorage antes de activar Realtime, súbelos ahora
-      if (profile?.role === "admin") {
+      if (error) {
+        console.error("Error leyendo custom_curriculum:", error.message);
+        return;
+      }
+
+      if (!Array.isArray(data)) return;
+
+      const { normalRows, dbHiddenCourses, dbHiddenTopics } =
+        parseCurriculumRows(data);
+
+      const currentRole = explicitRole || profile?.role;
+
+      if (currentRole === "admin") {
         const localSavedCustom = JSON.parse(
           localStorage.getItem(CUSTOM_CURRICULUM_KEY) || "[]"
         );
@@ -287,60 +294,55 @@ export default function App() {
         });
 
         (localSavedHidden.courses || []).forEach((c) => {
-          if (!dbHiddenCourses.has(c)) {
+          if (!dbHiddenCourses.includes(c)) {
             missingRows.push({ course: HIDDEN_COURSE_MARKER, topic: c });
           }
         });
 
         (localSavedHidden.topics || []).forEach((t) => {
-          if (!dbHiddenTopics.has(t)) {
+          if (!dbHiddenTopics.includes(t)) {
             missingRows.push({ course: HIDDEN_TOPIC_MARKER, topic: t });
           }
         });
 
         if (missingRows.length > 0) {
-          const { error: syncErr } = await supabase
+          const { error: upsertErr } = await supabase
             .from("custom_curriculum")
-            .insert(missingRows);
+            .upsert(missingRows, {
+              onConflict: "course,topic",
+              ignoreDuplicates: true,
+            });
 
-          if (!syncErr) {
-            // Volver a leer la tabla ya con los datos migrados
-            const { data: refreshed } = await supabase
-              .from("custom_curriculum")
-              .select("id, course, topic")
-              .order("created_at", { ascending: true });
+          if (upsertErr) {
+            // Fallback por si la tabla no tiene índice único compuesto
+            await supabase.from("custom_curriculum").insert(missingRows);
+          }
 
-            if (refreshed) {
-              const finalRows = [];
-              const finalHiddenC = new Set();
-              const finalHiddenT = new Set();
-              refreshed.forEach((r) => {
-                if (r.course === HIDDEN_COURSE_MARKER && r.topic)
-                  finalHiddenC.add(r.topic);
-                else if (r.course === HIDDEN_TOPIC_MARKER && r.topic)
-                  finalHiddenT.add(r.topic);
-                else finalRows.push(r);
-              });
-              setCustomCurriculum(finalRows);
-              setHiddenCurriculum({
-                courses: Array.from(finalHiddenC),
-                topics: Array.from(finalHiddenT),
-              });
-              return;
-            }
-          } else {
-            console.error("Error migrando cambios locales:", syncErr.message);
+          const { data: refreshed } = await supabase
+            .from("custom_curriculum")
+            .select("id, course, topic")
+            .order("created_at", { ascending: true });
+
+          if (Array.isArray(refreshed)) {
+            const parsedRefreshed = parseCurriculumRows(refreshed);
+            setCustomCurriculum(parsedRefreshed.normalRows);
+            setHiddenCurriculum({
+              courses: parsedRefreshed.dbHiddenCourses,
+              topics: parsedRefreshed.dbHiddenTopics,
+            });
+            return;
           }
         }
       }
 
       setCustomCurriculum(normalRows);
       setHiddenCurriculum({
-        courses: Array.from(dbHiddenCourses),
-        topics: Array.from(dbHiddenTopics),
+        courses: dbHiddenCourses,
+        topics: dbHiddenTopics,
       });
-    }
-  }, [demoMode, profile?.role]);
+    },
+    [demoMode, profile?.role]
+  );
 
   const reloadApprovedProblems = useCallback(async () => {
     if (!isSupabaseConfigured || !supabase || demoMode) {
@@ -405,7 +407,7 @@ export default function App() {
         if (prof?.is_approved) {
           await Promise.all([
             reloadApprovedProblems(),
-            loadCustomCurriculumFromDb(),
+            loadCustomCurriculumFromDb(prof.role),
           ]);
         }
       } catch (err) {
@@ -440,7 +442,7 @@ export default function App() {
     return () => subscription.unsubscribe();
   }, [fetchProfileAndProblems]);
 
-  // SUSCRIPCIÓN EN TIEMPO REAL (Supabase Realtime + Respaldo automático)
+  // SUSCRIPCIÓN EN TIEMPO REAL + REFRESCO AL VOLVER A LA PESTAÑA
   useEffect(() => {
     if (
       !isSupabaseConfigured ||
@@ -453,12 +455,12 @@ export default function App() {
     }
 
     const channel = supabase
-      .channel("pem-trainer-realtime-sync")
+      .channel(`pem-sync-${session.user.id}-${Date.now()}`)
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "custom_curriculum" },
         () => {
-          loadCustomCurriculumFromDb();
+          loadCustomCurriculumFromDb(profile.role);
         }
       )
       .on(
@@ -470,22 +472,47 @@ export default function App() {
       )
       .subscribe();
 
-    // Respaldo de sincronización cada 10s por si Realtime no está habilitado en la tabla
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === "visible") {
+        loadCustomCurriculumFromDb(profile.role);
+      }
+    };
+
+    window.addEventListener("focus", handleVisibilityOrFocus);
+    document.addEventListener("visibilitychange", handleVisibilityOrFocus);
+
     const intervalId = setInterval(() => {
-      loadCustomCurriculumFromDb();
-    }, 10000);
+      loadCustomCurriculumFromDb(profile.role);
+    }, 5000);
 
     return () => {
       supabase.removeChannel(channel);
+      window.removeEventListener("focus", handleVisibilityOrFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityOrFocus);
       clearInterval(intervalId);
     };
   }, [
     demoMode,
     session,
     profile?.is_approved,
+    profile?.role,
     loadCustomCurriculumFromDb,
     reloadApprovedProblems,
   ]);
+
+  const persistRowsToDb = async (rows) => {
+    const { error } = await supabase.from("custom_curriculum").upsert(rows, {
+      onConflict: "course,topic",
+      ignoreDuplicates: true,
+    });
+
+    if (error) {
+      const fallback = await supabase.from("custom_curriculum").insert(rows);
+      if (fallback.error) {
+        throw new Error(fallback.error.message);
+      }
+    }
+  };
 
   const handleUpdateProblem = async (updatedProblem) => {
     const {
@@ -515,9 +542,7 @@ export default function App() {
         .update(cleanFields)
         .eq("id", id);
 
-      if (error) {
-        throw new Error(error.message);
-      }
+      if (error) throw new Error(error.message);
     } else {
       setLocalGeneratedProblems((prev) =>
         prev.map((p) => (p.id === id ? { ...p, ...cleanFields } : p))
@@ -545,9 +570,7 @@ export default function App() {
         .delete()
         .eq("id", problemId);
 
-      if (error) {
-        throw new Error(error.message);
-      }
+      if (error) throw new Error(error.message);
     } else {
       setLocalGeneratedProblems((prev) =>
         prev.filter((p) => p.id !== problemId)
@@ -600,18 +623,18 @@ export default function App() {
     });
 
     if (isSupabaseConfigured && supabase && !demoMode) {
-      await supabase
-        .from("custom_curriculum")
-        .delete()
-        .eq("course", HIDDEN_COURSE_MARKER)
-        .eq("topic", cleanCourse);
+      try {
+        await supabase
+          .from("custom_curriculum")
+          .delete()
+          .eq("course", HIDDEN_COURSE_MARKER)
+          .eq("topic", cleanCourse);
 
-      const { error } = await supabase.from("custom_curriculum").insert(newRows);
-      if (error) {
-        console.error("Error guardando asignatura:", error.message);
-        alert("Error al sincronizar asignatura en Supabase: " + error.message);
+        await persistRowsToDb(newRows);
+        await loadCustomCurriculumFromDb(profile?.role);
+      } catch (err) {
+        alert("No se pudo guardar la asignatura en Supabase: " + err.message);
       }
-      await loadCustomCurriculumFromDb();
     }
   };
 
@@ -648,25 +671,22 @@ export default function App() {
     });
 
     if (isSupabaseConfigured && supabase && !demoMode) {
-      await supabase
-        .from("custom_curriculum")
-        .delete()
-        .eq("course", HIDDEN_TOPIC_MARKER)
-        .eq("topic", hiddenKey);
+      try {
+        await supabase
+          .from("custom_curriculum")
+          .delete()
+          .eq("course", HIDDEN_TOPIC_MARKER)
+          .eq("topic", hiddenKey);
 
-      const { error } = await supabase
-        .from("custom_curriculum")
-        .insert([{ course: cleanCourse, topic: cleanTopic }]);
-
-      if (error) {
-        console.error("Error guardando tema:", error.message);
-        alert("Error al sincronizar tema en Supabase: " + error.message);
+        await persistRowsToDb([{ course: cleanCourse, topic: cleanTopic }]);
+        await loadCustomCurriculumFromDb(profile?.role);
+      } catch (err) {
+        alert("No se pudo guardar el tema en Supabase: " + err.message);
       }
-      await loadCustomCurriculumFromDb();
     }
   };
 
-  // --- Eliminar cualquier Asignatura (personalizada o base) ---
+  // --- Eliminar cualquier Asignatura ---
   const handleDeleteCourse = async (courseName) => {
     const isBaseCourse = CURRICULUM.some((c) => c.course === courseName);
 
@@ -682,21 +702,25 @@ export default function App() {
     }));
 
     if (isSupabaseConfigured && supabase && !demoMode) {
-      await supabase
-        .from("custom_curriculum")
-        .delete()
-        .eq("course", courseName);
-
-      if (isBaseCourse) {
+      try {
         await supabase
           .from("custom_curriculum")
-          .insert([{ course: HIDDEN_COURSE_MARKER, topic: courseName }]);
+          .delete()
+          .eq("course", courseName);
+
+        if (isBaseCourse) {
+          await persistRowsToDb([
+            { course: HIDDEN_COURSE_MARKER, topic: courseName },
+          ]);
+        }
+        await loadCustomCurriculumFromDb(profile?.role);
+      } catch (err) {
+        alert("Error eliminando asignatura en Supabase: " + err.message);
       }
-      await loadCustomCurriculumFromDb();
     }
   };
 
-  // --- Eliminar cualquier Tema (personalizado o base) ---
+  // --- Eliminar cualquier Tema ---
   const handleDeleteTopic = async (courseName, topicName) => {
     const baseCourse = CURRICULUM.find((c) => c.course === courseName);
     const isBaseTopic = !!baseCourse?.topics?.includes(topicName);
@@ -727,31 +751,33 @@ export default function App() {
     }
 
     if (isSupabaseConfigured && supabase && !demoMode) {
-      await supabase
-        .from("custom_curriculum")
-        .delete()
-        .eq("course", courseName)
-        .eq("topic", topicName);
-
-      if (!baseCourse) {
-        const { data: leftRows } = await supabase
-          .from("custom_curriculum")
-          .select("id")
-          .eq("course", courseName);
-
-        if (!leftRows || leftRows.length === 0) {
-          await supabase
-            .from("custom_curriculum")
-            .insert([{ course: courseName, topic: "" }]);
-        }
-      }
-
-      if (isBaseTopic) {
+      try {
         await supabase
           .from("custom_curriculum")
-          .insert([{ course: HIDDEN_TOPIC_MARKER, topic: hiddenKey }]);
+          .delete()
+          .eq("course", courseName)
+          .eq("topic", topicName);
+
+        if (!baseCourse) {
+          const { data: leftRows } = await supabase
+            .from("custom_curriculum")
+            .select("id")
+            .eq("course", courseName);
+
+          if (!leftRows || leftRows.length === 0) {
+            await persistRowsToDb([{ course: courseName, topic: "" }]);
+          }
+        }
+
+        if (isBaseTopic) {
+          await persistRowsToDb([
+            { course: HIDDEN_TOPIC_MARKER, topic: hiddenKey },
+          ]);
+        }
+        await loadCustomCurriculumFromDb(profile?.role);
+      } catch (err) {
+        alert("Error eliminando tema en Supabase: " + err.message);
       }
-      await loadCustomCurriculumFromDb();
     }
   };
 
@@ -764,7 +790,7 @@ export default function App() {
         .from("custom_curriculum")
         .delete()
         .in("course", [HIDDEN_COURSE_MARKER, HIDDEN_TOPIC_MARKER]);
-      await loadCustomCurriculumFromDb();
+      await loadCustomCurriculumFromDb(profile?.role);
     }
   };
 
