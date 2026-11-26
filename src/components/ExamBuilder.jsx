@@ -28,15 +28,19 @@ export default function ExamBuilder({ problems, curriculum = CURRICULUM }) {
   const [printMode, setPrintMode] = useState("screen");
 
   useEffect(() => {
-    if (
-      course !== "Todos" &&
-      curriculum.length > 0 &&
-      !curriculum.some((c) => c.course === course)
-    ) {
-      setCourse(curriculum[0].course);
-      setSelectedTopic("Todos");
+    if (course !== "Todos" && curriculum.length > 0) {
+      const courseObj = curriculum.find((c) => c.course === course);
+      if (!courseObj) {
+        setCourse(curriculum[0].course);
+        setSelectedTopic("Todos");
+      } else if (
+        selectedTopic !== "Todos" &&
+        !(courseObj.topics || []).includes(selectedTopic)
+      ) {
+        setSelectedTopic("Todos");
+      }
     }
-  }, [curriculum, course]);
+  }, [curriculum, course, selectedTopic]);
 
   const availableTopics =
     curriculum.find((c) => c.course === course)?.topics || [];

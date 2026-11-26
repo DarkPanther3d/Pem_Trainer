@@ -28,20 +28,26 @@ export default function ProblemBank({
   const [revealedAnswers, setRevealedAnswers] = useState({});
   const [completedIds, setCompletedIds] = useState({});
 
-  useEffect(() => {
-    if (
-      selectedCourse !== "Todos" &&
-      !curriculum.some((c) => c.course === selectedCourse)
-    ) {
-      setSelectedCourse("Todos");
-      setSelectedTopic("Todos");
-    }
-  }, [curriculum, selectedCourse]);
-
   const availableTopics = useMemo(() => {
     if (selectedCourse === "Todos") return [];
     return curriculum.find((c) => c.course === selectedCourse)?.topics || [];
   }, [curriculum, selectedCourse]);
+
+  // Sincroniza automáticamente si el administrador elimina la asignatura o el tema seleccionado
+  useEffect(() => {
+    if (selectedCourse !== "Todos") {
+      const courseObj = curriculum.find((c) => c.course === selectedCourse);
+      if (!courseObj) {
+        setSelectedCourse("Todos");
+        setSelectedTopic("Todos");
+      } else if (
+        selectedTopic !== "Todos" &&
+        !(courseObj.topics || []).includes(selectedTopic)
+      ) {
+        setSelectedTopic("Todos");
+      }
+    }
+  }, [curriculum, selectedCourse, selectedTopic]);
 
   const filteredPool = useMemo(() => {
     return problems.filter((p) => {
@@ -105,7 +111,6 @@ export default function ProblemBank({
 
   return (
     <div className="space-y-6">
-      {/* Barra de Filtros y Cantidad Sin Límite */}
       <div className="bg-white dark:bg-uni-900 border border-slate-200 dark:border-blue-900/60 rounded-2xl p-6 shadow-sm space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2.5">
@@ -224,7 +229,6 @@ export default function ProblemBank({
         </div>
       </div>
 
-      {/* Lista de Ejercicios Instanciados */}
       {filteredPool.length === 0 ? (
         <div className="bg-white dark:bg-uni-900 border border-slate-200 dark:border-blue-900/60 rounded-2xl p-10 text-center space-y-2">
           <BookOpen className="w-8 h-8 mx-auto text-slate-400" />
